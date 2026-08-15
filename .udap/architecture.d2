@@ -1,0 +1,13 @@
+# udap:meta cloud=digitalocean region=nyc1 target=do-droplet
+
+user: Internet User { shape: person; udap-type: generic.user }
+vpc: DigitalOcean nyc1 {
+  droplet: v2dopy Droplet { shape: rectangle; udap-type: do.droplet }
+  nginx: Nginx Reverse Proxy { shape: rectangle; udap-type: generic.app }
+  app: Django App (Gunicorn) { shape: rectangle; udap-type: generic.app }
+  db: PostgreSQL { shape: cylinder; udap-type: generic.db }
+}
+
+user -> vpc.nginx: HTTP :80
+vpc.nginx -> vpc.app: proxy :8000
+vpc.app -> vpc.db: SQL :5432

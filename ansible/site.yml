@@ -1,0 +1,243 @@
+---
+- name: Configure v2dopy Django application
+  hosts: web
+  become: true
+  gather_facts: true
+
+  vars:
+    app_user: v2dopy
+    app_dir: /opt/v2dopy
+    venv_dir: /opt/v2dopy/venv
+    app_port: 8000
+    db_name: v2dopy
+    db_user: v2dopy
+    db_host: localhost
+
+  tasks:
+    # ── System packages ──────────────────────────────────────────────────────
+    - name: Wait for apt lock to release
+      ansible.builtin.shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+      changed_when: false
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      retries: 3
+      delay: 10
+
+    - name: Install system packages
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - postgresql
+          - postgresql-contrib
+          - libpq-dev
+          - nginx
+          - git
+          - curl
+        state: present
+
+    # ── App user ─────────────────────────────────────────────────────────────
+    - name: Create app user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /bin/bash
+        home: "{{ app_dir }}"
+        create_home: true
+
+    # ── PostgreSQL ───────────────────────────────────────────────────────────
+    - name: Ensure PostgreSQL service is running
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Create PostgreSQL database user
+      ansible.builtin.shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_user }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE ROLE {{ db_user }} WITH LOGIN PASSWORD '{{ lookup('env', 'DB_PASSWORD') }}';"
+      changed_when: false
+      no_log: true
+
+    - name: Create PostgreSQL database
+      ansible.builtin.shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE DATABASE {{ db_name }} OWNER {{ db_user }};"
+      changed_when: false
+
+    # ── Application code ─────────────────────────────────────────────────────
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Copy application files
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+        directory_mode: "0755"
+        force: true
+
+    # ── Python virtualenv ────────────────────────────────────────────────────
+    - name: Create Python virtualenv
+      ansible.builtin.command:
+        cmd: python3 -m venv "{{ venv_dir }}"
+        creates: "{{ venv_dir }}/bin/activate"
+
+    - name: Set venv ownership
+      ansible.builtin.file:
+        path: "{{ venv_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: true
+
+    - name: Install Python dependencies
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        state: present
+
+    # ── Environment file ──────────────────────────────────────────────────────
+    - name: Write .env file
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+        content: |
+          SECRET_KEY={{ lookup('env', 'SECRET_KEY') }}
+          DEBUG=False
+          DATABASE_URL=postgresql://{{ db_user }}:{{ lookup('env', 'DB_PASSWORD') }}@{{ db_host }}:5432/{{ db_name }}
+          ALLOWED_HOSTS=*
+          APP_ENV=production
+      no_log: true
+
+    # ── Django migrations & static files ─────────────────────────────────────
+    - name: Run Django migrations
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/python manage.py migrate --noinput"
+        chdir: "{{ app_dir }}"
+      environment:
+        SECRET_KEY: "{{ lookup('env', 'SECRET_KEY') }}"
+        DATABASE_URL: "postgresql://{{ db_user }}:{{ lookup('env', 'DB_PASSWORD') }}@{{ db_host }}:5432/{{ db_name }}"
+        DEBUG: "False"
+        ALLOWED_HOSTS: "*"
+      become_user: "{{ app_user }}"
+
+    - name: Collect static files
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/python manage.py collectstatic --noinput"
+        chdir: "{{ app_dir }}"
+      environment:
+        SECRET_KEY: "{{ lookup('env', 'SECRET_KEY') }}"
+        DATABASE_URL: "postgresql://{{ db_user }}:{{ lookup('env', 'DB_PASSWORD') }}@{{ db_host }}:5432/{{ db_name }}"
+        DEBUG: "False"
+        ALLOWED_HOSTS: "*"
+      become_user: "{{ app_user }}"
+
+    # ── Gunicorn systemd service ──────────────────────────────────────────────
+    - name: Write Gunicorn systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/v2dopy.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=v2dopy Django Application (Gunicorn)
+          After=network.target postgresql.service
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ venv_dir }}/bin/gunicorn v2dopy.wsgi:application \
+              --bind 127.0.0.1:{{ app_port }} \
+              --workers 2 \
+              --timeout 120 \
+              --access-logfile - \
+              --error-logfile -
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start Gunicorn service
+      ansible.builtin.service:
+        name: v2dopy
+        state: restarted
+        enabled: true
+
+    # ── Nginx reverse proxy ───────────────────────────────────────────────────
+    - name: Remove default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write Nginx vhost config
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/v2dopy
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              client_max_body_size 20M;
+
+              location /static/ {
+                  alias {{ app_dir }}/staticfiles/;
+                  expires 30d;
+              }
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_connect_timeout 60s;
+                  proxy_read_timeout 120s;
+              }
+          }
+
+    - name: Enable nginx site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/v2dopy
+        dest: /etc/nginx/sites-enabled/v2dopy
+        state: link
+
+    - name: Test nginx config
+      ansible.builtin.command:
+        cmd: nginx -t
+      changed_when: false
+
+    - name: Restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+        enabled: true
+
+    # ── Final health check ────────────────────────────────────────────────────
+    - name: Wait for app to be ready on port 80
+      ansible.builtin.wait_for:
+        host: localhost
+        port: 80
+        delay: 5
+        timeout: 60
